@@ -14,23 +14,24 @@ manipulate filtering rules and keep them persistent.
 
 Experiments have been made using a KVM/Qemu env. In order to get it
 working following configurations has been done to Qemu conf :
-$ tail -2 /etc/libvirt/qemu.conf
-rx_queue_size = 1024
-tx_queue_size = 1024
 
-$ virsh edit node1
-    ...
-    <interface type='network'>
-      <mac address='52:50:00:40:30:37'/>
-      <source network='netdev'/>
-      <model type='virtio'/>
-      <driver queues='8' rx_queue_size='1024' tx_queue_size='1024'>
-        <host csum='off' gso='off' tso4='off' tso6='off' ecn='off' ufo='off' mrg_rxbuf='off'/>
-        <guest csum='off' tso4='off' tso6='off' ecn='off' ufo='off'/>
-      </driver>
-      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
-    </interface>
-    ...
+	$ tail -2 /etc/libvirt/qemu.conf
+	rx_queue_size = 1024
+	tx_queue_size = 1024
+
+	$ virsh edit node1
+	    ...
+	    <interface type='network'>
+	      <mac address='52:50:00:40:30:37'/>
+	      <source network='netdev'/>
+	      <model type='virtio'/>
+	      <driver queues='8' rx_queue_size='1024' tx_queue_size='1024'>
+	        <host csum='off' gso='off' tso4='off' tso6='off' ecn='off' ufo='off' mrg_rxbuf='off'/>
+	        <guest csum='off' tso4='off' tso6='off' ecn='off' ufo='off'/>
+	      </driver>
+	      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+	    </interface>
+	    ...
 
 
 # Content
