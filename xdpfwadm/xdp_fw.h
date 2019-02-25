@@ -27,14 +27,18 @@ enum {
 	XDPFW_RULE_ADD,
 	XDPFW_RULE_DEL,
 	XDPFW_RULE_LIST,
+	XDPFW_VRID_ADD,
+	XDPFW_VRID_DEL,
+	XDPFW_VRID_LIST,
 };
 
-#define XDPFW_MAP_CNT 1
+#define XDPFW_MAP_CNT 2
 static struct {
 	char *path;
 	bool loaded;
 } xdpfw_exported_maps[XDPFW_MAP_CNT] = {
-	{ "/sys/fs/bpf/xdpfw_l3_filter",	false}
+	{ "/sys/fs/bpf/xdpfw_l3_filter"		, false},
+	{ "/sys/fs/bpf/xdpfw_vrrp_vrid_filter"	, false}
 };
 
 struct flow_key {
@@ -42,7 +46,15 @@ struct flow_key {
 		__u32 addr;
 		__u32 addr6[4];
 	};
-	__u32 proto;
+	__u32	proto;
+} __attribute__ ((__aligned__(8)));
+
+struct vrrp_filter {
+	__u32	action;
+	__u64	drop_packets;
+	__u64	total_packets;
+	__u64	drop_bytes;
+	__u64	total_bytes;
 } __attribute__ ((__aligned__(8)));
 
 #endif

@@ -43,6 +43,7 @@
 static char *bpf_file = NULL;
 static char *ip_str = NULL;
 static int ifindex = 0;
+static int vrrp_vrid = 0;
 static int action = 0;
 
 /*
@@ -59,9 +60,10 @@ xdpfw_unload(int ifindex)
 	/* Remove all exported map file */
 	for (i = 0; i < XDPFW_MAP_CNT; i++) {
 		if (unlink(xdpfw_exported_maps[i].path) < 0) {
-			fprintf(stderr, "WARN: cannot unlink map(%s) file:%s errno:%d (%m)\n",
-				map_data[0].name, xdpfw_exported_maps[i].path,
-				errno);
+			fprintf(stderr, "WARN: cannot unlink map(%s) file:%s errno:%d (%m)\n"
+				      , map_data[0].name
+				      , xdpfw_exported_maps[i].path
+				      , errno);
 		}
 	}
 }
@@ -91,8 +93,9 @@ bpf_fs_check_path(const char *path)
 
 	if (!err && st_fs.f_type != BPF_FS_MAGIC) {
 		fprintf(stderr, "ERR: specified path %s is not on BPF FS\n\n"
-			" You need to mount the BPF filesystem type like:\n"
-			"  mount -t bpf bpf /sys/fs/bpf/\n\n", path);
+			        " You need to mount the BPF filesystem type like:\n"
+			        "  mount -t bpf bpf /sys/fs/bpf/\n\n"
+			      , path);
 		err = -EINVAL;
 	}
 
@@ -146,13 +149,12 @@ xdpfw_map_export(int idx)
 
 	/* Export map as a file */
 	if (bpf_obj_pin(map_fd[idx], path) != 0) {
-		fprintf(stderr,
-			"ERR: Cannot pin map(%s) file:%s errno:%d (%m)\n",
-			map_data[idx].name, path, errno);
+		fprintf(stderr, "ERR: Cannot pin map(%s) file:%s errno:%d (%m)\n"
+			      , map_data[idx].name, path, errno);
 		return -1;
 	}
 
-	printf(" - Export bpf-map:%-30s to   file:%s\n", map_data[idx].name,
+	printf(". Exporting bpf-map:%-30s to file:%s\n", map_data[idx].name,
 	       path);
 	return 0;
 }
@@ -231,8 +233,8 @@ xdpfw_rule(int action)
 	/* Open sysfs bpf map */
 	fd = bpf_obj_get(xdpfw_exported_maps[0].path);
 	if (fd < 0) {
-		fprintf(stderr, "Cant open bpf_map[%s] errno:%d (%m)\n",
-			xdpfw_exported_maps[0].path, errno);
+		fprintf(stderr, "Cant open bpf_map[%s] errno:%d (%m)\n"
+			      , xdpfw_exported_maps[0].path, errno);
 		return -1;
 	}
 
@@ -241,9 +243,8 @@ xdpfw_rule(int action)
 	else if (action == XDPFW_RULE_DEL)
 		ret = bpf_map_delete_elem(fd, &key);
 	if (ret != 0) {
-		fprintf(stderr,
-			"Cant Add filtering rule for IP address [%s] (%m)!\n",
-			ip_str);
+		fprintf(stderr, "Cant Add filtering rule for IP address [%s] (%m)!\n"
+			      , ip_str);
 		close(fd);
 		return -1;
 	}
@@ -263,11 +264,12 @@ xdpfw_rule_list(void)
 	/* Open sysfs bpf map */
 	fd = bpf_obj_get(xdpfw_exported_maps[0].path);
 	if (fd < 0) {
-		fprintf(stderr, "Cant open bpf_map[%s] errno:%d (%m)\n",
-			xdpfw_exported_maps[0].path, errno);
+		fprintf(stderr, "Cant open bpf_map[%s] errno:%d (%m)\n"
+			      , xdpfw_exported_maps[0].path, errno);
 		return -1;
 	}
 
+	printf("IPFW rulset :\n");
 	while (bpf_map_get_next_key(fd, &key, &next_key) == 0) {
 		key = next_key;
 		family = (key.proto == ETH_P_IP) ? AF_INET : AF_INET6;
@@ -278,8 +280,97 @@ xdpfw_rule_list(void)
 			return -1;
 		}
 
-		printf(" * [IPv%d] %s\n", (family == AF_INET) ? 4 : 6,
-		       addr_str);
+		printf(". [IPv%d] %s\n", (family == AF_INET) ? 4 : 6, addr_str);
+	}
+
+	close(fd);
+	return 0;
+}
+
+static int
+xdpfw_vrid(int action)
+{
+	unsigned int nr_cpus = bpf_num_possible_cpus();
+	struct vrrp_filter vrrp_rule[nr_cpus];
+	__u32 vrid = vrrp_vrid;
+	int ret, fd, i;
+
+	/* Open sysfs bpf map */
+	fd = bpf_obj_get(xdpfw_exported_maps[1].path);
+	if (fd < 0) {
+		fprintf(stderr, "Cant open bpf_map[%s] errno:%d (%m)\n"
+			      , xdpfw_exported_maps[1].path, errno);
+		return -1;
+	}
+
+	/* PERCPU rule update */
+	for (i = 0; i < nr_cpus; i++) {
+		memset(&vrrp_rule[i], 0, sizeof(struct vrrp_filter));
+		vrrp_rule[i].action = (action == XDPFW_VRID_ADD) ? 1 : 0;
+	}
+
+	ret = bpf_map_update_elem(fd, &vrid, vrrp_rule, 0);
+	if (ret != 0) {
+		fprintf(stderr, "Cant Update VRRP VRID filtering rule for VRID(%d) (%m)!\n"
+			      , vrrp_vrid);
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
+	return 0;
+}
+
+static int
+xdpfw_vrid_get_stats_percpu(int fd, __u32 key, __u32 *action, __u64 *drop_packets,
+			    __u64 *total_packets, __u64 *drop_bytes,
+			    __u64 *total_bytes)
+{
+	unsigned int nr_cpus = bpf_num_possible_cpus();
+	struct vrrp_filter vrrp_rule[nr_cpus];
+	int i, ret;
+
+	ret = bpf_map_lookup_elem(fd, &key, vrrp_rule);
+	if (ret != 0)
+		return -1;
+
+	for (i = 0; i < nr_cpus; i++) {
+		*action = vrrp_rule[i].action;
+		*drop_packets += vrrp_rule[i].drop_packets;
+		*total_packets += vrrp_rule[i].total_packets;
+		*drop_bytes += vrrp_rule[i].drop_bytes;
+		*total_bytes += vrrp_rule[i].total_bytes;
+	}
+
+	return 0;
+}
+
+static int
+xdpfw_vrid_list(void)
+{
+	__u64 drop_packets, total_packets, drop_bytes, total_bytes;
+	__u32 action;
+	int fd, i;
+
+	/* Open sysfs bpf map */
+	fd = bpf_obj_get(xdpfw_exported_maps[1].path);
+	if (fd < 0) {
+		fprintf(stderr, "Cant open bpf_map[%s] errno:%d (%m)\n"
+			      , xdpfw_exported_maps[1].path, errno);
+		return -1;
+	}
+
+	printf("VRRP VRID rulset :\n");
+	for (i = 0; i < 256; i++) {
+		action = drop_packets = total_packets = drop_bytes = total_bytes = 0;
+		xdpfw_vrid_get_stats_percpu(fd, i, &action, &drop_packets, &total_packets,
+					    &drop_bytes, &total_bytes);
+		if (drop_packets != 0 || total_packets != 0 || drop_bytes != 0 ||
+		    total_bytes != 0) {
+			printf(". VRID(%d): action:%s dp:%lld tp:%lld db:%lld tb:%lld\n"
+			       , i, action ? "ACCEPT" : "DENY"
+			       , drop_packets, total_packets, drop_bytes, total_bytes);
+		}
 	}
 
 	close(fd);
@@ -289,25 +380,27 @@ xdpfw_rule_list(void)
 static int
 xdpfw_action(void)
 {
-
 	switch (action) {
 	case XDPFW_LOAD_BPF:
 		xdpfw_load();
 		break;
-
 	case XDPFW_UNLOAD_BPF:
 		xdpfw_unload(ifindex);
 		break;
-
 	case XDPFW_RULE_ADD:
 	case XDPFW_RULE_DEL:
 		xdpfw_rule(action);
 		break;
-
 	case XDPFW_RULE_LIST:
 		xdpfw_rule_list();
 		break;
-
+	case XDPFW_VRID_ADD:
+	case XDPFW_VRID_DEL:
+		xdpfw_vrid(action);
+		break;
+	case XDPFW_VRID_LIST:
+		xdpfw_vrid_list();
+		break;
 	default:
 		exit(0);
 	}
@@ -328,6 +421,9 @@ usage(const char *prog)
 	fprintf(stderr, "  -a, --rule-add		Add a filtering rule\n");
 	fprintf(stderr, "  -d, --rule-del		Delete a filtering rule\n");
 	fprintf(stderr, "  -L, --rule-list		Display Rules list\n");
+	fprintf(stderr, "  -A, --vrid-add		Add a VRRP VRID\n");
+	fprintf(stderr, "  -D, --vrid-del		Delete a VRRP VRID\n");
+	fprintf(stderr, "  -V, --vrid-list		Display VRRP VRID bitmaps\n");
 	fprintf(stderr, "  -h, --help			Display this help message\n");
 }
 
@@ -347,12 +443,15 @@ parse_cmdline(int argc, char **argv)
 		{"rule-add", required_argument, NULL, 'a'},
 		{"rule-del", required_argument, NULL, 'd'},
 		{"rule-list", no_argument, NULL, 'L'},
+		{"vrid-add", required_argument, NULL, 'A'},
+		{"vrid-del", required_argument, NULL, 'D'},
+		{"vrid-list", no_argument, NULL, 'V'},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0}
 	};
 
 	curind = optind;
-	while (longindex = -1, (c = getopt_long(argc, argv, "hLl:u:i:a:d:",
+	while (longindex = -1, (c = getopt_long(argc, argv, "hLVl:u:i:a:d:A:D:",
 					        long_options, &longindex)) != -1) {
 		if (longindex >= 0 && long_options[longindex].has_arg == required_argument &&
 		    optarg && !optarg[0]) {
@@ -386,6 +485,17 @@ parse_cmdline(int argc, char **argv)
 			break;
 		case 'L':
 			action = XDPFW_RULE_LIST;
+			break;
+		case 'A':
+			action = XDPFW_VRID_ADD;
+			vrrp_vrid = atoi(optarg);
+			break;
+		case 'D':
+			action = XDPFW_VRID_DEL;
+			vrrp_vrid = atoi(optarg);
+			break;
+		case 'V':
+			action = XDPFW_VRID_LIST;
 			break;
 		case '?':
 			if (optopt && argv[curind][1] != '-')

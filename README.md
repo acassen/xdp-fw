@@ -71,10 +71,13 @@ working following configurations has been done to Qemu conf :
 	Usage: ./xdpfwadm [OPTION...]
 	  -l, --load-bpf		Load a BPF prog
 	  -u, --unload-bpf		Unload a BPF prog
-	  -i, --ifindex			Net device ifindex to bind BPF prog to
+	  -i, --ifindex		Net device ifindex to bind BPF prog to
 	  -a, --rule-add		Add a filtering rule
 	  -d, --rule-del		Delete a filtering rule
 	  -L, --rule-list		Display Rules list
+	  -A, --vrid-add		Add a VRRP VRID
+	  -D, --vrid-del		Delete a VRRP VRID
+	  -V, --vrid-list		Display VRRP VRID bitmaps
 	  -h, --help			Display this help message
 
 
