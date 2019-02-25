@@ -16,7 +16,7 @@ CFLAGS := -g -O2 -Wall
 # kbuilddir can be redefined
 kbuilddir ?= /lib/modules/$(shell uname -r)/build
 KERNEL = $(kbuilddir)
-KERNEL = /usr/src/linux
+#KERNEL = /usr/src/linux
 
 LINUXINCLUDE := -I$(KERNEL)/tools/include
 LINUXINCLUDE := -I$(KERNEL)/tools/include/uapi

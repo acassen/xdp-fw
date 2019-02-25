@@ -33,8 +33,21 @@
 #include <linux/if_vlan.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/icmpv6.h>
 #include <bpf_endian.h>
 #include <bpf_helpers.h>
+
+/* bpf_trace_printk() output:
+ * /sys/kernel/debug/tracing/trace_pipe
+ */
+#define bpf_printk(fmt, ...)				\
+({							\
+	char ____fmt[] = fmt;				\
+	bpf_trace_printk(____fmt, sizeof(____fmt),	\
+		     ##__VA_ARGS__);			\
+})
+
+
 
 /* linux/if_vlan.h have not exposed this as UAPI, thus mirror some here
  *
@@ -43,13 +56,34 @@
  *      @h_vlan_encapsulated_proto: packet type ID or len
  */
 struct _vlan_hdr {
-	__be16 hvlan_TCI;
-	__be16 h_vlan_encapsulated_proto;
+	__be16	hvlan_TCI;
+	__be16	h_vlan_encapsulated_proto;
 };
 
+struct vrrphdr {
+	__u8	vers_type;
+	__u8	vrid;
+	__u8	priority;
+	__u8	naddr;
+	union {
+		struct {
+			__u8	auth_type;
+			__u8	adver_int;
+		} v2;
+		struct {
+			__u16	adver_int;
+		} v3;
+	};
+	__u16	chksum;
+} __attribute__ ((__packed__));
+#define IPPROTO_VRRP	112
+
+#define ICMPV6_ND_NEIGHBOR_SOLICIT	135
+#define ICMPV6_ND_NEIGHBOR_ADVERT	136
+
 struct parse_pkt {
-	__u16 l3_proto;
-	__u16 l3_offset;
+	__u16	l3_proto;
+	__u16	l3_offset;
 };
 
 struct flow_key {
@@ -57,7 +91,15 @@ struct flow_key {
 		__u32 addr;
 		__u32 addr6[4];
 	};
-	__u32 proto;
+	__u32	proto;
+} __attribute__ ((__aligned__(8)));
+
+struct vrrp_filter {
+	__u32	action;
+	__u64	drop_packets;
+	__u64	total_packets;
+	__u64	drop_bytes;
+	__u64	total_bytes;
 } __attribute__ ((__aligned__(8)));
 
 struct bpf_map_def SEC("maps") l3_filter = {
@@ -68,27 +110,57 @@ struct bpf_map_def SEC("maps") l3_filter = {
 	.map_flags = BPF_F_NO_PREALLOC,
 };
 
-#ifdef  DEBUG
-/* Only use this for debug output. Notice output from bpf_trace_printk()
- * end-up in /sys/kernel/debug/tracing/trace_pipe
- */
-#define bpf_debug(fmt, ...)						\
-		({							\
-			char ____fmt[] = fmt;				\
-			bpf_trace_printk(____fmt, sizeof(____fmt),	\
-				     ##__VA_ARGS__);			\
-		})
-#else
-#define bpf_debug(fmt, ...) { } while (0)
-#endif
+struct bpf_map_def SEC("maps") vrrp_vrid_filter = {
+	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+	.key_size = sizeof (__u32),
+	.value_size = sizeof (struct vrrp_filter),
+	.max_entries = 256,
+	.map_flags = 0,
+};
 
-/* Packet filter */
+
+/* ICMPv6 filtering */
+static __always_inline bool
+icmp6_accept(struct icmp6hdr *icmp6h)
+{
+	if (icmp6h->icmp6_type == ICMPV6_ND_NEIGHBOR_SOLICIT ||
+	    icmp6h->icmp6_type == ICMPV6_ND_NEIGHBOR_ADVERT)
+		return true;
+	return false;
+}
+
+/* VRRP filtering */
 static __always_inline int
-filter_packet(void *data, void *data_end, struct parse_pkt *pkt)
+vrrp_filter(struct vrrphdr *vrrph, int len)
+{
+	struct vrrp_filter *vrrpf;
+	int key = vrrph->vrid;
+
+	vrrpf = bpf_map_lookup_elem(&vrrp_vrid_filter, &key);
+	if (!vrrpf)
+		return XDP_PASS;
+
+	vrrpf->total_packets++;
+	vrrpf->total_bytes += len;
+	if (vrrpf->action)
+		return XDP_PASS;
+
+	vrrpf->drop_packets++;
+	vrrpf->drop_bytes += len;
+	return XDP_DROP;
+}
+
+/* IP filtering */
+static __always_inline int
+layer3_filter(void *data, void *data_end, struct parse_pkt *pkt)
 {
 	struct iphdr *iph;
 	struct ipv6hdr *ip6h;
+	struct icmp6hdr *icmp6h;
+	struct vrrphdr *vrrph = NULL;
+	struct ip_auth_hdr *ah;
 	struct flow_key key = { };
+	int offset = 0, tot_len = 0;
 	__u64 *drop_cnt;
 
 	/* Room sanitize */
@@ -96,16 +168,52 @@ filter_packet(void *data, void *data_end, struct parse_pkt *pkt)
 		iph = data + pkt->l3_offset;
 		if (iph + 1 > data_end)
 			return XDP_PASS;
+		/* FIXME: fragmentation handling */
+		tot_len = bpf_ntohs(iph->tot_len);
+		offset += pkt->l3_offset;
 		key.proto = ETH_P_IP;
 		key.addr6[1] = key.addr6[2] = key.addr6[3] = 0;
 		key.addr = iph->daddr;
+		if (iph->protocol == IPPROTO_VRRP) {
+			vrrph = data + offset + sizeof(struct iphdr);
+			if (vrrph + 1 > data_end)
+				return XDP_DROP;
+		} else if (iph->protocol == IPPROTO_AH) {
+			ah = data + offset + sizeof(struct iphdr);
+			if (ah + 1 > data_end)
+				return XDP_PASS;
+			offset += sizeof(struct iphdr);
+			if (ah->nexthdr == IPPROTO_VRRP) {
+				vrrph = data + offset + sizeof(struct ip_auth_hdr);
+				if (vrrph + 1 > data_end)
+					return XDP_DROP;
+			}
+		}
 	} else if (pkt->l3_proto == ETH_P_IPV6) {
 		ip6h = data + pkt->l3_offset;
 		if (ip6h + 1 > data_end)
 			return XDP_PASS;
+
+		/* ICMPv6 filtering */
+		if (ip6h->nexthdr == IPPROTO_ICMPV6) {
+			icmp6h = data + pkt->l3_offset + sizeof(struct ipv6hdr);
+			if (icmp6h + 1 > data_end)
+				return XDP_DROP;
+
+			if (icmp6_accept(icmp6h))
+				return XDP_PASS;
+		}
+
+		/* FIXME: fragmentation handling */
+		tot_len = bpf_ntohs(ip6h->payload_len);
 		key.proto = ETH_P_IPV6;
 		__builtin_memcpy(key.addr6, ip6h->daddr.s6_addr32,
 				 sizeof (key.addr6));
+		if (ip6h->nexthdr == IPPROTO_VRRP) {
+			vrrph = data + pkt->l3_offset + sizeof(struct ipv6hdr);
+			if (vrrph + 1 > data_end)
+				return XDP_DROP;
+		}
 	} else {
 		return XDP_PASS;
 	}
@@ -115,6 +223,9 @@ filter_packet(void *data, void *data_end, struct parse_pkt *pkt)
 		*drop_cnt += 1;
 		return XDP_DROP;
 	}
+
+	if (vrrph)
+		return vrrp_filter(vrrph, tot_len);
 
 	return XDP_PASS;
 }
@@ -136,8 +247,8 @@ parse_eth_frame(struct ethhdr *eth, void *data_end, struct parse_pkt *pkt)
 	eth_type = eth->h_proto;
 
 	/* Handle outer VLAN tag */
-	if (eth_type == bpf_htons(ETH_P_8021Q)
-	    || eth_type == bpf_htons(ETH_P_8021AD)) {
+	if (eth_type == bpf_htons(ETH_P_8021Q) ||
+	    eth_type == bpf_htons(ETH_P_8021AD)) {
 		vlan_hdr = (void *) eth + offset;
 		offset += sizeof (*vlan_hdr);
 		if ((void *) eth + offset > data_end)
@@ -147,8 +258,8 @@ parse_eth_frame(struct ethhdr *eth, void *data_end, struct parse_pkt *pkt)
 	}
 
 	/* Handle inner (Q-in-Q) VLAN tag */
-	if (eth_type == bpf_htons(ETH_P_8021Q)
-	    || eth_type == bpf_htons(ETH_P_8021AD)) {
+	if (eth_type == bpf_htons(ETH_P_8021Q) ||
+	    eth_type == bpf_htons(ETH_P_8021AD)) {
 		vlan_hdr = (void *) eth + offset;
 		offset += sizeof (*vlan_hdr);
 		if ((void *) eth + offset > data_end)
@@ -173,7 +284,7 @@ xdp_drop(struct xdp_md *ctx)
 	if (!parse_eth_frame(data, data_end, &pkt))
 		return XDP_PASS;
 
-	return filter_packet(data, data_end, &pkt);
+	return layer3_filter(data, data_end, &pkt);
 }
 
 char _license[] SEC("license") = "GPL";
